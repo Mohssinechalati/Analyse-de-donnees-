@@ -1,0 +1,608 @@
+
+#   - Historical Data.csv                  : 6722 jours x 21 devises
+#   - Currencies and Country EconomyWise.csv : pays / type d'économie
+# Variable quantitative étudiée : USD/EUR  (variable continue)
+# Variable qualitative étudiée  : Economy Type (variable nominale)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 0. Préparation
+# ---------------------------------------------------------------------
+# install.packages(c('tidyverse', 'e1071'))  
+library(tidyverse)   # readr, dplyr, ggplot2, forcats, tidyr, lubridate
+library(e1071)       # skewness() et kurtosis()
+
+# Mettre le dossier de travail sur le dossier des CSV (Session > Set Working Directory)
+devises <- read_csv("Currencies and Country EconomyWise.csv")
+histo   <- read_csv("Historical Data.csv")
+
+# Nettoyage : un nom de colonne contient un espace final ("USD/NGN ")
+names(histo)   <- str_trim(names(histo))
+devises        <- devises |> mutate(`Conversion Name` = str_trim(`Conversion Name`))
+names(devises) <- c("pays", "type_eco", "conversion")
+
+# La date est au format jj-mm-aaaa
+histo <- histo |> mutate(Date = dmy(Date))
+
+glimpse(devises)
+glimpse(histo)
+summary(histo)
+
+# Q0. Nombre d'individus et de variables ? Type de chaque colonne ?
+dim(devises)   # 21 x 3
+dim(histo)     # 6722 x 22
+# Réponse : devises = 21 individus (pays/zones) et 3 variables, toutes qualitatives
+#   nominales (pays, type_eco, conversion). histo = 6722 individus (jours, du
+#   2006-05-16 au 2025-12-12) et 22 variables : Date (temporelle) + 21 taux de
+#   change, tous continus. type_eco pourrait être vue comme ordinale
+#   (développé > émergent > frontière) mais on la traite comme nominale.
+
+# Valeurs de contrôle
+nrow(histo)                       # 6722
+sum(is.na(histo$`USD/EUR`))       # 178 valeurs manquantes
+mean(histo$`USD/EUR`, na.rm = TRUE)    # ~ 0.8328
+median(histo$`USD/EUR`, na.rm = TRUE)  # 0.849
+table(devises$type_eco)           # Developed 8, Emerging 8, Frontier 5
+
+# ---------------------------------------------------------------------
+# PARTIE 1 - Variable qualitative : type_eco
+# ---------------------------------------------------------------------
+
+# 1.1 Tableau des fréquences
+table(devises$type_eco)
+prop.table(table(devises$type_eco))
+
+freq_type <- devises |>
+  count(type_eco, name = "freq_abs") |>
+  mutate(freq_rel    = freq_abs / sum(freq_abs),
+         pourcentage = round(100 * freq_rel, 1))
+freq_type
+# Réponse : Developed 8 (38,1 %), Emerging 8 (38,1 %), Frontier 5 (23,8 %).
+
+# Exemple du cours (18 observations)
+x <- c('D','A','D','C','E','B','D','E','C','E','B','C','D','A','B','D','B','E')
+table(x)
+round(prop.table(table(x)), 3)
+# Q1.1 Réponse : A = 2, B = 4, C = 3, D = 5, E = 4  (somme = 18) -> vérifié.
+
+# 1.2 Le mode
+mode_qual <- function(x) {
+  t <- table(x)
+  names(t)[t == max(t)]   # renvoie tous les modes en cas d'égalité
+}
+mode_qual(x)
+mode_qual(devises$type_eco)
+mode_qual(devises$pays)
+# Q1.2 Réponse : le mode de x est D (5). Pour type_eco il y a DEUX modes
+#   (Developed Economy et Emerging Market Economy, 8 chacun) : la distribution
+#   est bimodale. Pour pays, chaque modalité apparaît une fois : tout le monde
+#   est mode, la variable est un identifiant. La moyenne n'a pas de sens car
+#   les modalités sont des noms, pas des nombres : on ne peut ni les ajouter
+#   ni les diviser.
+
+# 1.3 Variable ordinale : maximum local
+# Aucune variable ordinale dans les CSV : on en construit une en découpant
+# USD/EUR en 5 niveaux ordonnés (feature engineering).
+eur <- histo |> drop_na(`USD/EUR`) |> pull(`USD/EUR`)
+
+niveau_eur <- cut(eur,
+                  breaks = c(0.6, 0.7, 0.8, 0.9, 1.0, 1.1),
+                  labels = c("Très faible", "Faible", "Moyen", "Élevé", "Très élevé"),
+                  right = FALSE, ordered_result = TRUE)
+levels(niveau_eur)
+f <- table(niveau_eur)
+f
+n <- length(f)
+est_max_local <- sapply(seq_len(n), function(i) {
+  gauche <- if (i > 1) f[i - 1] else -Inf
+  droite <- if (i < n) f[i + 1] else -Inf
+  f[i] >= gauche & f[i] >= droite
+})
+names(f)[est_max_local]
+
+tibble(niveau = niveau_eur) |>
+  count(niveau, name = "freq_abs") |>
+  mutate(freq_rel = freq_abs / sum(freq_abs),
+         freq_cum = cumsum(freq_rel))
+# Q1.3 Réponse : effectifs ~ 443 / 2046 / 2272 / 1719 / 64. Il y a un seul
+#   maximum local : "Moyen" (0,8 à 0,9 euro pour 1 dollar). La fréquence
+#   cumulée donne la proportion de jours où le taux est inférieur ou égal à un
+#   niveau (ex. ~ 73 % des jours à "Moyen" ou moins). Elle n'a de sens que pour
+#   une variable ordinale, car il faut un ordre des modalités.
+
+# 1.4 Utilité en analyse de données
+# a) Déséquilibre de classes
+max(freq_type$freq_abs) / min(freq_type$freq_abs)   # 8 / 5 = 1,6
+
+# b) Imputation par le mode : type_eco n'a aucune valeur manquante, donc on
+#    simule 2 valeurs manquantes pour illustrer la méthode.
+devises_na <- devises |>
+  mutate(type_eco = replace(type_eco, c(3, 12), NA))
+mode_type <- names(which.max(table(devises_na$type_eco)))   # premier mode rencontré
+devises_imp <- devises_na |>
+  mutate(type_eco = replace_na(type_eco, mode_type))
+table(devises_na$type_eco,  useNA = "ifany")
+table(devises_imp$type_eco, useNA = "ifany")
+
+# c) Regroupement des modalités rares
+devises |>
+  mutate(type_reg = fct_lump_prop(factor(type_eco), prop = 0.25,
+                                  other_level = "Autres")) |>
+  count(type_reg)
+# Q1.4 Réponse :
+#  (a) Rapport 1,6 : la variable est peu déséquilibrée (un déséquilibre sérieux
+#      se situerait plutôt au-delà de 3 à 5).
+#  (b) Après imputation, la modalité choisie gagne les valeurs manquantes : sa
+#      fréquence gonfle artificiellement et la distribution se déforme. Ici,
+#      comme il y a égalité de modes, le choix est arbitraire : à éviter.
+#  (c) Avec 25 %, "Frontier Economy" (23,8 % < 25 %) est regroupée dans
+#      "Autres". Avec 20 %, aucune modalité n'est regroupée ; avec 40 %, les
+#      trois le sont. Plus le seuil monte, plus on perd d'information.
+
+# 1.5 Graphiques
+ggplot(devises, aes(x = type_eco)) + geom_bar()
+
+ggplot(devises, aes(x = fct_infreq(type_eco))) +
+  geom_bar(fill = "steelblue") +
+  labs(x = "Type d'économie", y = "Effectif")
+
+ggplot(devises, aes(y = fct_infreq(type_eco))) + geom_bar()
+
+ggplot(freq_type, aes(x = fct_reorder(type_eco, freq_abs, .desc = TRUE), y = freq_abs)) +
+  geom_col(fill = "tomato") +
+  geom_text(aes(label = paste0(pourcentage, " %")), vjust = -0.4) +
+  labs(x = "Type d'économie", y = "Effectif")
+
+ggplot(freq_type, aes(x = "", y = freq_abs, fill = type_eco)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  theme_void()
+
+# Facettes / deux variables : on rapproche type_eco et le nombre de valeurs
+# manquantes par devise (qualité des données)
+na_par_devise <- histo |>
+  summarise(across(-Date, ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "conversion", values_to = "nb_na") |>
+  left_join(devises, by = "conversion")
+
+ggplot(na_par_devise, aes(x = type_eco, y = nb_na, fill = type_eco)) +
+  geom_col() +
+  labs(x = "Type d'économie", y = "Valeurs manquantes cumulées")
+ggplot(devises, aes(x = type_eco, fill = type_eco)) + geom_bar() +
+  facet_wrap(~ type_eco)
+# Q1.5 Réponse :
+#  (a) Réordonner par fréquence (variable nominale, donc sans ordre naturel)
+#      rend la lecture et la comparaison immédiates : on voit le classement.
+#  (b) Camembert : peu de modalités (3 à 5) et message "part du tout".
+#      Barres : comparer des effectifs, plus de modalités. Les barres sont
+#      plus précises car l'oeil compare mieux des longueurs que des angles.
+#  (c) position = 'fill' montre les proportions au sein de chaque barre
+#      (composition), au lieu des effectifs : on compare les parts même si
+#      les barres n'ont pas le même total.
+
+# ---------------------------------------------------------------------
+# PARTIE 2 - Variable quantitative : USD/EUR
+# ---------------------------------------------------------------------
+
+# 2.1 Variable discrète : nombre de devises manquantes par jour
+histo_na <- histo |>
+  mutate(nb_na = rowSums(is.na(across(-Date))))
+
+freq_na <- histo_na |>
+  count(nb_na, name = "freq_abs") |>
+  mutate(freq_rel = freq_abs / sum(freq_abs),
+         freq_cum = cumsum(freq_rel))
+freq_na
+freq_na$nb_na[which.max(freq_na$freq_abs)]   # mode
+ggplot(histo_na, aes(x = factor(nb_na))) + geom_bar() +
+  labs(x = "Nombre de devises manquantes dans la journée", y = "Effectif")
+# Q2.1 Réponse : le mode est 0 (~ 5123 jours sur 6722, soit ~ 76 %). On peut
+#   traiter cette variable comme qualitative car elle prend peu de valeurs
+#   entières distinctes : on compte des effectifs par valeur, comme des
+#   modalités (ici même ordonnées).
+
+# 2.2 Variable continue : fréquences par classes
+range(eur)    # 0.625 et 1.042
+
+tab_eur <- tibble(classe = cut(eur, breaks = seq(0.60, 1.05, by = 0.05),
+                               right = FALSE, dig.lab = 3)) |>
+  count(classe, name = "freq_abs", .drop = FALSE) |>
+  mutate(freq_rel = freq_abs / sum(freq_abs),
+         freq_cum = cumsum(freq_rel),
+         centre   = seq(0.625, 1.025, by = 0.05))
+tab_eur
+
+tab_eur$classe[which.max(tab_eur$freq_abs)]
+weighted.mean(tab_eur$centre, tab_eur$freq_abs)
+mean(eur)
+
+# Impact du choix des intervalles : largeur 0,025
+tab_eur_fin <- tibble(classe = cut(eur, breaks = seq(0.60, 1.05, by = 0.025),
+                                   right = FALSE)) |>
+  count(classe, name = "freq_abs", .drop = FALSE)
+tab_eur_fin$classe[which.max(tab_eur_fin$freq_abs)]
+# Q2.2 Réponse : classe modale avec largeur 0,05 : [0,85 ; 0,90[ (1485 jours).
+#   Avec largeur 0,025 : [0,875 ; 0,9[ (936 jours). Moyenne approchée ~ 0,8314
+#   contre moyenne réelle ~ 0,8328 : l'écart vient du fait qu'on remplace
+#   chaque valeur par le centre de sa classe (perte d'information). Le choix des
+#   intervalles change la forme (bimodale ou non), la classe modale et la
+#   précision : il faut tester plusieurs largeurs.
+
+# 2.3 Quantiles et valeurs aberrantes
+S <- c(200, 205, 210, 215, 220, 225, 230, 235, 240, 245, 450)
+quantile(S, probs = c(.25, .5, .75), type = 2)   # méthode du cours : 210, 225, 240
+quantile(S, probs = c(.25, .5, .75))             # type 7 par défaut
+
+q <- quantile(S, probs = c(.25, .75), type = 2, names = FALSE)
+iqr_S   <- q[2] - q[1]
+lim_inf <- q[1] - 1.5 * iqr_S
+lim_sup <- q[2] + 1.5 * iqr_S
+c(lim_inf, lim_sup)                  # 165 et 285
+S[S < lim_inf | S > lim_sup]         # 450
+
+# Déciles, p5 / p95, résumé en 5 nombres sur USD/EUR
+quantile(eur, probs = seq(.1, .9, by = .1))
+quantile(eur, probs = c(.05, .95))
+summary(eur)
+
+# Valeurs aberrantes (règle 1,5 x IQR) sur l'EUR puis sur des devises plus
+# "sauvages" : TRY, NGN, JPY
+nb_aberrantes <- function(v) {
+  v  <- v[!is.na(v)]
+  q1 <- quantile(v, .25); q3 <- quantile(v, .75); i <- q3 - q1
+  sum(v < q1 - 1.5 * i | v > q3 + 1.5 * i)
+}
+nb_aberrantes(histo$`USD/EUR`)   # 0
+nb_aberrantes(histo$`USD/TRY`)   # ~ 1132
+nb_aberrantes(histo$`USD/NGN`)   # ~ 720
+nb_aberrantes(histo$`USD/JPY`)   # ~ 341
+
+histo |>
+  filter(`USD/TRY` > 30) |>
+  select(Date, `USD/TRY`) |>
+  arrange(desc(`USD/TRY`)) |>
+  slice_head(n = 5)
+# Q2.4 Réponse :
+#  (a) S : Q1 = 210, médiane = 225, Q3 = 240 (type = 2), bornes 165 et 285,
+#      valeur aberrante : 450.
+#  (b) type = 7 interpole entre les observations (Q1 = 212,5 ; Q3 = 237,5) :
+#      la définition du quantile diffère, donc les valeurs aussi.
+#  (c) USD/EUR : 0 valeur aberrante, Q1 = 0,758, Q3 = 0,904, IQR = 0,146,
+#      bornes [0,539 ; 1,123]. Pour TRY et NGN, de nombreux points sortent des
+#      bornes, mais ce ne sont PAS des erreurs de saisie : ce sont des
+#      dévaluations/crises réelles (la livre turque est passée de ~ 1,4 à plus
+#      de 40). La règle 1,5 x IQR détecte donc ici de vraies valeurs extrêmes
+#      plausibles, qu'il ne faut pas supprimer.
+
+# 2.4 Indices de dispersion
+var(eur); sd(eur)                      # division par n - 1 : 0.007394 ; 0.08599
+mean((eur - mean(eur))^2)              # variance "cours" (n) : 0.007393
+max(eur) - min(eur)                    # étendue : 0.417
+IQR(eur)                               # 0.146
+
+# Normalisation (centrée-réduite) et symétrie / aplatissement
+z_eur <- (eur - mean(eur)) / sd(eur)
+mean(z_eur); sd(z_eur)                 # ~ 0 et 1
+skewness(eur)                          # ~ -0.26 (légèrement asymétrique à gauche)
+kurtosis(eur)                          # ~ -0.94 (aplatie, plus plate que la normale)
+
+# Nouvelle variable : écart à la moyenne
+histo |>
+  mutate(ecart_moy = `USD/EUR` - mean(`USD/EUR`, na.rm = TRUE)) |>
+  select(Date, `USD/EUR`, ecart_moy) |>
+  slice_head(n = 6)
+
+# Dispersion par groupe : les devises n'ont pas la même unité (1 USD = 0,8 EUR
+# mais 1 USD = 23 000 VND), donc on compare avec le coefficient de variation.
+histo_long <- histo |>
+  pivot_longer(-Date, names_to = "conversion", values_to = "taux") |>
+  left_join(devises, by = "conversion")
+
+disp_devise <- histo_long |>
+  group_by(type_eco, conversion) |>
+  summarise(moyenne    = mean(taux, na.rm = TRUE),
+            ecart_type = sd(taux,   na.rm = TRUE),
+            cv         = ecart_type / moyenne,
+            .groups = "drop") |>
+  arrange(cv)
+disp_devise
+
+disp_devise |>
+  group_by(type_eco) |>
+  summarise(cv_moyen = mean(cv), cv_max = max(cv))
+# Q2.5 Réponse :
+#  (a) Variance n : 0,0073927 ; variance n-1 : 0,0073939. La différence est
+#      négligeable ici (n = 6544) ; elle compterait sur un petit échantillon.
+#  (b) Sur l'ecart-type brut, la devise la plus dispersée est le VND/IDR
+#      (très grandes valeurs), mais c'est un artefact d'unité. Avec le
+#      coefficient de variation : SGD (5,7 %) la plus stable ; TRY (130 %) puis
+#      NGN (104 %) les plus dispersées.
+#  (c) En finance, la dispersion EST l'information : c'est la volatilité,
+#      donc le risque de change ; une devise stable (SGD, CNY) s'oppose à une
+#      devise très instable (TRY, NGN).
+
+# ---------------------------------------------------------------------
+# Graphiques pour variable quantitative (USD/EUR)
+# ---------------------------------------------------------------------
+df_eur <- tibble(eur = eur)
+
+# Histogramme
+ggplot(df_eur, aes(x = eur)) +
+  geom_histogram(binwidth = 0.05, boundary = 0.6, fill = "steelblue", color = "white") +
+  labs(x = "USD/EUR", y = "Effectif")
+
+# Densité
+ggplot(df_eur, aes(x = eur)) +
+  geom_density(fill = "tomato", alpha = 0.5) +
+  labs(x = "USD/EUR", y = "Densité")
+
+# Histogramme + densité
+ggplot(df_eur, aes(x = eur)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 0.025,
+                 fill = "grey80", color = "white") +
+  geom_density(color = "red", linewidth = 1)
+
+# Boîte à moustaches
+ggplot(df_eur, aes(y = eur)) + geom_boxplot(fill = "lightgreen") + labs(y = "USD/EUR")
+
+# Stem-and-leaf
+stem(eur)
+
+# QQ-plot
+ggplot(df_eur, aes(sample = eur)) + stat_qq() + stat_qq_line(color = "red")
+
+# Fonction de répartition empirique
+ggplot(df_eur, aes(x = eur)) + stat_ecdf(geom = "step") +
+  labs(x = "USD/EUR", y = "F(x)")
+
+# Évolution temporelle (utile pour interpréter la forme)
+ggplot(histo, aes(x = Date, y = `USD/EUR`)) + geom_line(color = "steelblue")
+
+# Comparaison EUR vs TRY (même graphique, distributions très différentes)
+histo_long |>
+  filter(conversion %in% c("USD/EUR", "USD/TRY")) |>
+  ggplot(aes(x = taux)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  facet_wrap(~ conversion, scales = "free")
+# Interprétation : l'histogramme de USD/EUR est plutôt aplati avec deux bosses
+#   (autour de 0,75-0,80 et 0,85-0,90) : deux régimes de taux dans la période
+#   (euro fort avant 2015, dollar fort ensuite). Le QQ-plot s'écarte de la droite
+#   aux extrémités : la distribution n'est pas normale (kurtosis < 0). Pour une
+#   devise très asymétrique comme TRY, une transformation log serait indiquée.
+
+
+# =====================================================================
+# PARTIE 3 - Analyse temporelle : Date, Année, Mois et Jour
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 3.1 Création des variables temporelles
+# ---------------------------------------------------------------------
+
+histo <- histo |>
+  mutate(
+    annee = year(Date),
+    mois_num = month(Date),
+    mois = factor(
+      mois_num,
+      levels = 1:12,
+      labels = c("Janvier", "Février", "Mars", "Avril",
+                 "Mai", "Juin", "Juillet", "Août",
+                 "Septembre", "Octobre", "Novembre", "Décembre"),
+      ordered = TRUE
+    ),
+    jour = day(Date)
+  )
+
+# Vérification des nouvelles variables
+glimpse(histo)
+
+# Q3.1 : Identifier les nouvelles variables et leur type.
+# Réponse :
+# annee : variable temporelle discrète.
+# mois_num : variable quantitative discrète.
+# mois : variable qualitative ordinale.
+# jour : variable quantitative discrète.
+
+
+# ---------------------------------------------------------------------
+# 3.2 Répartition des observations par année
+# ---------------------------------------------------------------------
+
+freq_annee <- histo |>
+  count(annee, name = "freq_abs") |>
+  mutate(
+    freq_rel = freq_abs / sum(freq_abs),
+    pourcentage = round(freq_rel * 100, 2)
+  )
+
+freq_annee
+
+# Graphique : nombre d'observations par année
+ggplot(freq_annee, aes(x = factor(annee), y = freq_abs)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = freq_abs), vjust = -0.4, size = 3) +
+  labs(
+    title = "Nombre d'observations par année",
+    x = "Année",
+    y = "Effectif"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Q3.2 : Comment sont réparties les observations par année ?
+# Réponse : le tableau et le graphique présentent le nombre
+# d'observations disponibles pour chaque année.
+
+
+# ---------------------------------------------------------------------
+# 3.3 Statistiques descriptives annuelles de USD/EUR
+# ---------------------------------------------------------------------
+
+stats_annuelles <- histo |>
+  group_by(annee) |>
+  summarise(
+    effectif = sum(!is.na(`USD/EUR`)),
+    moyenne = mean(`USD/EUR`, na.rm = TRUE),
+    mediane = median(`USD/EUR`, na.rm = TRUE),
+    ecart_type = sd(`USD/EUR`, na.rm = TRUE),
+    minimum = min(`USD/EUR`, na.rm = TRUE),
+    maximum = max(`USD/EUR`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_annuelles
+
+# Q3.3 : Quelle est l'évolution du taux USD/EUR selon les années ?
+
+# Graphique : évolution annuelle de la moyenne
+ggplot(stats_annuelles, aes(x = annee, y = moyenne)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "Évolution annuelle du taux moyen USD/EUR",
+    x = "Année",
+    y = "Taux moyen USD/EUR"
+  ) +
+  theme_minimal()
+
+# Interprétation :
+# Ce graphique permet d'identifier les années où le taux moyen
+# USD/EUR est le plus élevé et le plus faible.
+
+
+# ---------------------------------------------------------------------
+# 3.4 Distribution du taux USD/EUR par année
+# ---------------------------------------------------------------------
+
+ggplot(histo, aes(x = factor(annee), y = `USD/EUR`)) +
+  geom_boxplot(fill = "steelblue", na.rm = TRUE) +
+  labs(
+    title = "Distribution du taux USD/EUR par année",
+    x = "Année",
+    y = "Taux USD/EUR"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Q3.4 : Comment varie la distribution du taux USD/EUR
+# d'une année à l'autre ?
+# Interprétation :
+# Le boxplot permet de comparer les médianes, la dispersion
+# et les valeurs extrêmes du taux USD/EUR selon les années.
+
+
+# ---------------------------------------------------------------------
+# 3.5 Répartition mensuelle du taux USD/EUR
+# ---------------------------------------------------------------------
+
+stats_mensuelles <- histo |>
+  group_by(mois) |>
+  summarise(
+    effectif = sum(!is.na(`USD/EUR`)),
+    moyenne = mean(`USD/EUR`, na.rm = TRUE),
+    mediane = median(`USD/EUR`, na.rm = TRUE),
+    ecart_type = sd(`USD/EUR`, na.rm = TRUE),
+    minimum = min(`USD/EUR`, na.rm = TRUE),
+    maximum = max(`USD/EUR`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_mensuelles
+
+# Q3.5 : Existe-t-il des différences entre les mois ?
+
+# Graphique : moyenne du taux selon le mois
+ggplot(stats_mensuelles, aes(x = mois, y = moyenne)) +
+  geom_col(fill = "tomato") +
+  labs(
+    title = "Taux moyen USD/EUR selon le mois",
+    x = "Mois",
+    y = "Taux moyen USD/EUR"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Interprétation :
+# Ce graphique permet de comparer les taux moyens des douze mois
+# et d'identifier les mois présentant les valeurs les plus élevées
+# et les plus faibles.
+
+
+# ---------------------------------------------------------------------
+# 3.6 Analyse mensuelle par année
+# ---------------------------------------------------------------------
+
+stats_annee_mois <- histo |>
+  group_by(annee, mois) |>
+  summarise(
+    effectif = sum(!is.na(`USD/EUR`)),
+    moyenne = mean(`USD/EUR`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_annee_mois
+
+# Graphique : évolution mensuelle pour chaque année
+ggplot(
+  stats_annee_mois,
+  aes(
+    x = mois,
+    y = moyenne,
+    group = annee,
+    color = factor(annee)
+  )
+) +
+  geom_line() +
+  labs(
+    title = "Évolution mensuelle du taux USD/EUR par année",
+    x = "Mois",
+    y = "Taux moyen USD/EUR",
+    color = "Année"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Q3.6 : Comment évolue le taux USD/EUR selon les mois
+# et les différentes années ?
+# Interprétation :
+# Ce graphique permet de comparer les variations mensuelles
+# entre les différentes années et d'observer les tendances.
+
+
+# ---------------------------------------------------------------------
+# 3.7 Analyse du taux USD/EUR selon le jour du mois
+# ---------------------------------------------------------------------
+
+stats_journalieres <- histo |>
+  group_by(jour) |>
+  summarise(
+    effectif = sum(!is.na(`USD/EUR`)),
+    moyenne = mean(`USD/EUR`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_journalieres
+
+# Graphique : taux moyen selon le jour du mois
+ggplot(stats_journalieres, aes(x = jour, y = moyenne)) +
+  geom_line(color = "darkgreen", linewidth = 1) +
+  geom_point(color = "darkgreen") +
+  scale_x_continuous(breaks = 1:31) +
+  labs(
+    title = "Taux moyen USD/EUR selon le jour du mois",
+    x = "Jour du mois",
+    y = "Taux moyen USD/EUR"
+  ) +
+  theme_minimal()
+
+# Q3.7 : Existe-t-il des différences entre les jours du mois ?
+# Interprétation :
+# Ce graphique compare les taux moyens observés du 1er au 31
+# du mois, toutes années confondues.
+
+
+# =====================================================================
+# FIN DE LA PARTIE 3
+# =====================================================================
+
